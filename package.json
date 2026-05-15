@@ -4,7 +4,7 @@
   "description": "Renderizador FFmpeg para Novoimovel.AI",
   "main": "server.js",
   "engines": {
-    "node": "20.x"
+    "node": "22.22.2"
   },
   "scripts": {
     "start": "node server.js"
