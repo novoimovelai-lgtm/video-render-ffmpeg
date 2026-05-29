@@ -1,5 +1,3 @@
- frontend já está 100% correto — MIN_FOTOS = 5, MAX_FOTOS = 12, botão bloqueado com menos de 5, upload bloqueado acima de 12. Só precisei corrigir o server.js. Aqui está o arquivo completo atualizado:
-
 /**
  * ============================================================
  * server.js — Cloud Run: Vídeo de Apresentação do Imóvel
@@ -46,6 +44,7 @@ app.use(express.json({ limit: '50mb' }));
 function ts()  { return `[${new Date().toISOString()}]`; }
 function uid() { return crypto.randomBytes(6).toString('hex'); }
 
+/** Download de arquivo via URL para caminho local. Retorna true/false. */
 function downloadFile(url, destPath) {
   return new Promise((resolve) => {
     const proto = url.startsWith('https') ? https : http;
@@ -63,22 +62,25 @@ function downloadFile(url, destPath) {
   });
 }
 
+/** Remove arquivos temporários silenciosamente. */
 function cleanup(...paths) {
   for (const p of paths) {
     try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
   }
 }
 
+/** Escapa texto para uso em drawtext do FFmpeg. */
 function ffEscape(str) {
   if (!str) return '';
   return String(str)
     .replace(/\\/g, '\\\\')
-    .replace(/'/g, '\u2019')
+    .replace(/'/g, '\u2019')  // apóstrofo tipográfico
     .replace(/:/g, '\\:')
     .replace(/\[/g, '\\[')
     .replace(/\]/g, '\\]');
 }
 
+/** Executa ffmpeg com spawnSync usando o binário do ffmpeg-static. */
 function runFFmpeg(args, maxBufferMB = 300) {
   return spawnSync(ffmpegPath, args, {
     encoding: 'utf8',
@@ -90,6 +92,10 @@ function runFFmpeg(args, maxBufferMB = 300) {
 // Normalização de parâmetros do frontend
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * Normaliza transition para os valores internos:
+ * 'corte' → 'cut' | outros: mantém
+ */
 function normalizeTransition(val) {
   if (!val) return 'dissolve';
   const v = String(val).toLowerCase().trim();
@@ -98,6 +104,10 @@ function normalizeTransition(val) {
   return 'dissolve';
 }
 
+/**
+ * Normaliza cameraMotion para os valores internos (sem hífens):
+ * 'zoom-in' → 'zoomin' | 'pan-left' → 'panleft' | etc.
+ */
 function normalizeCameraMotion(val) {
   if (!val) return 'auto';
   const v = String(val).toLowerCase().trim().replace(/-/g, '');
@@ -105,6 +115,10 @@ function normalizeCameraMotion(val) {
   return valid.includes(v) ? v : 'auto';
 }
 
+/**
+ * Normaliza music:
+ * 'sem_trilha' ou 'sem-trilha' → 'sem-trilha'
+ */
 function normalizeMusic(val) {
   if (!val) return 'sem-trilha';
   const v = String(val).toLowerCase().trim();
@@ -122,9 +136,9 @@ const RESOLUTIONS = {
   '16:9': { w: 1280, h: 720  },
 };
 
-const PHOTO_DURATION = 2.8;
-const END_CARD_DUR   = 2.5;
-const FADE_DUR       = 0.45;
+const PHOTO_DURATION = 2.8;   // segundos por foto
+const END_CARD_DUR   = 2.5;   // duração da tela final
+const FADE_DUR       = 0.45;  // duração do xfade entre fotos
 const FPS            = 25;
 
 const MUSIC_FILES = {
@@ -137,6 +151,10 @@ const MUSIC_FILES = {
 // Cálculo de duração (sem ffprobe)
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * Calcula duração aproximada do vídeo final sem usar ffprobe.
+ * Para xfade progressivo, cada junção reduz FADE_DUR do total.
+ */
 function calcVideoDuration(numPhotos, hasEndCard, transition) {
   const photoTotal = numPhotos * PHOTO_DURATION;
   const xfadeCount = transition === 'cut' ? 0 : Math.max(0, numPhotos - 1);
@@ -289,15 +307,18 @@ function generateEndCard(w, h, brokerName, brokerPhone, companyName, creci, jobI
 // ROTAS
 // ─────────────────────────────────────────────────────────────
 
+/** Rota raiz — teste de status no navegador */
 app.get('/', (req, res) => {
   res.json({
     success: true,
     status:  'online',
     message: 'Novoimovel.AI Video Renderer Online',
+    version: 'v2-transitions-kenburns-broker-endcard',
     ffmpeg:  ffmpegPath ? 'available' : 'not_found',
   });
 });
 
+/** Health check */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -403,6 +424,9 @@ app.post('/render-video', async (req, res) => {
           vfParts += ',' + brokerFilters.join(',');
         }
       }
+
+      // Watermark de versão — remover após validação
+      vfParts += `,drawtext=text='V2':fontsize=28:fontcolor=white@0.8:shadowcolor=black@0.9:shadowx=1:shadowy=1:x=12:y=12`;
 
       const ffInputs = ['-loop', '1', '-t', String(PHOTO_DURATION), '-i', imgPaths[i]];
       let   vfFinal  = vfParts;
@@ -543,6 +567,7 @@ app.post('/render-video', async (req, res) => {
       if (result.status !== 0) throw new Error(`Erro ao finalizar vídeo: ${result.stderr?.slice(0, 400)}`);
 
     } else {
+      // Duração calculada sem ffprobe
       const videoDuration = calcVideoDuration(imgPaths.length, true, transition);
       const fadeOutStart  = Math.max(0, videoDuration - 1.5).toFixed(2);
 
