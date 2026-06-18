@@ -35,7 +35,7 @@ const ffmpegPath = require('ffmpeg-static');
 const app  = express();
 const PORT = process.env.PORT || 8080;
 
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '200mb' }));
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -44,8 +44,23 @@ app.use(express.json({ limit: '50mb' }));
 function ts()  { return `[${new Date().toISOString()}]`; }
 function uid() { return crypto.randomBytes(6).toString('hex'); }
 
-/** Download de arquivo via URL para caminho local. Retorna true/false. */
+/** Download de arquivo via URL para caminho local. Suporta URLs http/https e data URIs base64. Retorna true/false. */
 function downloadFile(url, destPath) {
+  // Suporte a data URI (base64)
+  if (url.startsWith('data:')) {
+    try {
+      const commaIdx = url.indexOf(',');
+      if (commaIdx === -1) return Promise.resolve(false);
+      const b64  = url.slice(commaIdx + 1);
+      const buf  = Buffer.from(b64, 'base64');
+      fs.writeFileSync(destPath, buf);
+      return Promise.resolve(true);
+    } catch (e) {
+      console.error(`[downloadFile] Erro ao decodificar base64: ${e.message}`);
+      return Promise.resolve(false);
+    }
+  }
+
   return new Promise((resolve) => {
     const proto = url.startsWith('https') ? https : http;
     const file  = fs.createWriteStream(destPath);
