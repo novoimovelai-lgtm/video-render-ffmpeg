@@ -114,10 +114,6 @@ function runFFmpeg(args, maxBufferMB = 300) {
 // Normalização de parâmetros do frontend
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Normaliza transition para os valores internos:
- * 'corte' → 'cut' | outros: mantém
- */
 function normalizeTransition(val) {
   if (!val) return 'dissolve';
   const v = String(val).toLowerCase().trim();
@@ -126,10 +122,6 @@ function normalizeTransition(val) {
   return 'dissolve';
 }
 
-/**
- * Normaliza cameraMotion para os valores internos (sem hífens):
- * 'zoom-in' → 'zoomin' | 'pan-left' → 'panleft' | etc.
- */
 function normalizeCameraMotion(val) {
   if (!val) return 'auto';
   const v = String(val).toLowerCase().trim().replace(/-/g, '');
@@ -137,10 +129,6 @@ function normalizeCameraMotion(val) {
   return valid.includes(v) ? v : 'auto';
 }
 
-/**
- * Normaliza music:
- * 'sem_trilha' ou 'sem-trilha' → 'sem-trilha'
- */
 function normalizeMusic(val) {
   if (!val) return 'sem-trilha';
   const v = String(val).toLowerCase().trim();
@@ -158,9 +146,9 @@ const RESOLUTIONS = {
   '16:9': { w: 1280, h: 720  },
 };
 
-const PHOTO_DURATION = 2.8;   // segundos por foto
-const END_CARD_DUR   = 2.5;   // duração da tela final
-const FADE_DUR       = 0.45;  // duração do xfade entre fotos
+const PHOTO_DURATION = 2.8;
+const END_CARD_DUR   = 2.5;
+const FADE_DUR       = 0.45;
 const FPS            = 25;
 
 const MUSIC_FILES = {
@@ -173,10 +161,6 @@ const MUSIC_FILES = {
 // Cálculo de duração (sem ffprobe)
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Calcula duração aproximada do vídeo final sem usar ffprobe.
- * Para xfade progressivo, cada junção reduz FADE_DUR do total.
- */
 function calcVideoDuration(numPhotos, hasEndCard, transition) {
   const photoTotal = numPhotos * PHOTO_DURATION;
   const xfadeCount = transition === 'cut' ? 0 : Math.max(0, numPhotos - 1);
@@ -190,46 +174,43 @@ function calcVideoDuration(numPhotos, hasEndCard, transition) {
 // ─────────────────────────────────────────────────────────────
 
 function buildKenBurnsVF(index, w, h, cameraMotion) {
-  const frames    = Math.round(PHOTO_DURATION * FPS);
-  const zoomStart = 1.00;
-  const zoomEnd   = 1.08;
-  const step      = ((zoomEnd - zoomStart) / frames).toFixed(7);
+  const frames = Math.round(PHOTO_DURATION * FPS);
 
   const autoStyles = ['zoomin', 'zoomout', 'panleft', 'panup'];
-  const motion     = cameraMotion === 'auto' ? autoStyles[index % 4] : cameraMotion;
+  const motion = cameraMotion === 'auto' ? autoStyles[index % 4] : cameraMotion;
 
-  let zoomExpr, xExpr, yExpr;
+  let zExpr, xExpr, yExpr;
 
   switch (motion) {
     case 'zoomin':
-      zoomExpr = `zoom+'${step}'`;
-      xExpr    = `iw/2-(iw/zoom/2)`;
-      yExpr    = `ih/2-(ih/zoom/2)`;
+      zExpr = `min(zoom+0.0012,1.08)`;
+      xExpr = `iw/2-(iw/zoom/2)`;
+      yExpr = `ih/2-(ih/zoom/2)`;
       break;
     case 'zoomout':
-      zoomExpr = `if(eq(on\\,1)\\,${zoomEnd}\\,zoom-${step})`;
-      xExpr    = `iw/2-(iw/zoom/2)`;
-      yExpr    = `ih/2-(ih/zoom/2)`;
+      zExpr = `max(1.08-on*0.0012,1.0)`;
+      xExpr = `iw/2-(iw/zoom/2)`;
+      yExpr = `ih/2-(ih/zoom/2)`;
       break;
     case 'panleft':
-      zoomExpr = `${(zoomStart + 0.04).toFixed(4)}`;
-      xExpr    = `(iw/zoom/2)*on/${frames}`;
-      yExpr    = `ih/2-(ih/zoom/2)`;
+      zExpr = `1.05`;
+      xExpr = `(iw-iw/zoom)*on/${frames}`;
+      yExpr = `ih/2-(ih/zoom/2)`;
       break;
     case 'panup':
-      zoomExpr = `${(zoomStart + 0.04).toFixed(4)}`;
-      xExpr    = `iw/2-(iw/zoom/2)`;
-      yExpr    = `(ih/zoom/2)*on/${frames}`;
+      zExpr = `1.05`;
+      xExpr = `iw/2-(iw/zoom/2)`;
+      yExpr = `(ih-ih/zoom)*on/${frames}`;
       break;
     default:
-      zoomExpr = `zoom+'${step}'`;
-      xExpr    = `iw/2-(iw/zoom/2)`;
-      yExpr    = `ih/2-(ih/zoom/2)`;
+      zExpr = `min(zoom+0.0012,1.08)`;
+      xExpr = `iw/2-(iw/zoom/2)`;
+      yExpr = `ih/2-(ih/zoom/2)`;
   }
 
   return [
     `scale=${w * 2}:${h * 2},setsar=1`,
-    `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=${frames}:s=${w}x${h}:fps=${FPS}`,
+    `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${frames}:s=${w}x${h}:fps=${FPS}`,
     `setpts=PTS-STARTPTS`,
     `fps=${FPS}`,
   ].join(',');
@@ -330,7 +311,6 @@ function generateEndCard(w, h, brokerName, brokerPhone, companyName, creci, jobI
 // ROTAS
 // ─────────────────────────────────────────────────────────────
 
-/** Rota raiz — teste de status no navegador */
 app.get('/', (req, res) => {
   res.json({
     success: true,
@@ -341,7 +321,6 @@ app.get('/', (req, res) => {
   });
 });
 
-/** Health check */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -358,7 +337,6 @@ app.post('/render-video', async (req, res) => {
   console.log(`\n${ts()} ========== /render-video JOB ${jobId} ==========`);
 
   try {
-    // ── 1. Parse e normalização do payload ──────────────────────────
     const {
       pedidoId,
       userEmail,
@@ -376,22 +354,14 @@ app.post('/render-video', async (req, res) => {
     const cameraMotion = normalizeCameraMotion(req.body.cameraMotion);
 
     if (!Array.isArray(images) || images.length < 5) {
-      return res.status(400).json({
-        success: false,
-        error: 'Envie pelo menos 5 imagens para gerar o vídeo.',
-      });
+      return res.status(400).json({ success: false, error: 'Envie pelo menos 5 imagens para gerar o vídeo.' });
     }
-
     if (images.length > 12) {
-      return res.status(400).json({
-        success: false,
-        error: 'Envie no máximo 12 imagens para gerar o vídeo.',
-      });
+      return res.status(400).json({ success: false, error: 'Envie no máximo 12 imagens para gerar o vídeo.' });
     }
 
     const { w, h } = RESOLUTIONS[format] || RESOLUTIONS['9:16'];
 
-    // ── Logs de entrada ──────────────────────────────────────────────
     console.log(`${ts()} [${jobId}] pedidoId:     ${pedidoId || 'n/a'}`);
     console.log(`${ts()} [${jobId}] userEmail:    ${userEmail || 'n/a'}`);
     console.log(`${ts()} [${jobId}] images:       ${images.length} fotos`);
@@ -448,8 +418,7 @@ app.post('/render-video', async (req, res) => {
         }
       }
 
-      // Watermark de versão — remover após validação
-      vfParts += `,drawtext=text='V2':fontsize=28:fontcolor=white@0.8:shadowcolor=black@0.9:shadowx=1:shadowy=1:x=12:y=12`;
+      // Watermark V2 removido temporariamente para isolar erro do zoompan
 
       const ffInputs = ['-loop', '1', '-t', String(PHOTO_DURATION), '-i', imgPaths[i]];
       let   vfFinal  = vfParts;
@@ -601,7 +570,6 @@ app.post('/render-video', async (req, res) => {
       }
 
     } else {
-      // Duração calculada sem ffprobe
       const videoDuration = calcVideoDuration(imgPaths.length, true, transition);
       const fadeOutStart  = Math.max(0, videoDuration - 1.5).toFixed(2);
 
