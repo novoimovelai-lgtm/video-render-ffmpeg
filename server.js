@@ -35,7 +35,7 @@ const ffmpegPath = require('ffmpeg-static');
 const app  = express();
 const PORT = process.env.PORT || 8080;
 
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '200mb' }));
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -44,8 +44,30 @@ app.use(express.json({ limit: '50mb' }));
 function ts()  { return `[${new Date().toISOString()}]`; }
 function uid() { return crypto.randomBytes(6).toString('hex'); }
 
-/** Download de arquivo via URL para caminho local. Retorna true/false. */
+/** Extrai a parte útil do stderr do FFmpeg (ignora o header de versão). */
+function extractStderr(stderr) {
+  if (!stderr) return 'sem stderr';
+  // Pega os últimos 1200 chars — onde está o erro real
+  return stderr.slice(-1200) || stderr.slice(0, 1200) || 'sem stderr';
+}
+
+/** Download de arquivo via URL para caminho local. Suporta URLs http/https e data URIs base64. Retorna true/false. */
 function downloadFile(url, destPath) {
+  // Suporte a data URI (base64)
+  if (url.startsWith('data:')) {
+    try {
+      const commaIdx = url.indexOf(',');
+      if (commaIdx === -1) return Promise.resolve(false);
+      const b64  = url.slice(commaIdx + 1);
+      const buf  = Buffer.from(b64, 'base64');
+      fs.writeFileSync(destPath, buf);
+      return Promise.resolve(true);
+    } catch (e) {
+      console.error(`[downloadFile] Erro ao decodificar base64: ${e.message}`);
+      return Promise.resolve(false);
+    }
+  }
+
   return new Promise((resolve) => {
     const proto = url.startsWith('https') ? https : http;
     const file  = fs.createWriteStream(destPath);
@@ -296,7 +318,8 @@ function generateEndCard(w, h, brokerName, brokerPhone, companyName, creci, jobI
   const result = runFFmpeg(args, 100);
 
   if (result.status !== 0) {
-    console.error(`${ts()} [EndCard] ERRO: ${result.stderr?.slice(0, 500)}`);
+    const stderrReal = extractStderr(result.stderr);
+    console.error(`${ts()} [EndCard] ERRO: ${stderrReal}`);
     return null;
   }
   console.log(`${ts()} [EndCard] ✓ Tela final gerada`);
@@ -454,8 +477,9 @@ app.post('/render-video', async (req, res) => {
 
       const result = runFFmpeg(args, 150);
       if (result.status !== 0) {
-        console.error(`${ts()} [${jobId}] FFmpeg seg ${i} STDERR:\n${result.stderr?.slice(0, 1000)}`);
-        throw new Error(`Erro ao processar imagem ${i + 1}: ${result.stderr?.slice(0, 200)}`);
+        const stderrReal = extractStderr(result.stderr);
+        console.error(`${ts()} [${jobId}] FFmpeg seg ${i} STDERR:\n${stderrReal}`);
+        throw new Error(`Erro ao processar imagem ${i + 1}: ${stderrReal}`);
       }
       segmentPaths.push(segPath);
     }
@@ -482,7 +506,10 @@ app.post('/render-video', async (req, res) => {
         mainVideoPath,
       ];
       const result = runFFmpeg(args, 300);
-      if (result.status !== 0) throw new Error(`Erro na concatenação: ${result.stderr?.slice(0, 400)}`);
+      if (result.status !== 0) {
+        const stderrReal = extractStderr(result.stderr);
+        throw new Error(`Erro na concatenação: ${stderrReal}`);
+      }
 
     } else {
       const xfadeType =
@@ -512,7 +539,10 @@ app.post('/render-video', async (req, res) => {
 
         console.log(`${ts()} [${jobId}] xfade ${i}/${segmentPaths.length - 1}`);
         const result = runFFmpeg(args, 300);
-        if (result.status !== 0) throw new Error(`Erro no xfade ${i}: ${result.stderr?.slice(0, 400)}`);
+        if (result.status !== 0) {
+          const stderrReal = extractStderr(result.stderr);
+          throw new Error(`Erro no xfade ${i}: ${stderrReal}`);
+        }
         currentPath = xfadeOut;
       }
       mainVideoPath = currentPath;
@@ -543,7 +573,8 @@ app.post('/render-video', async (req, res) => {
           finalVideoPath = withEnd;
           console.log(`${ts()} [${jobId}] ✓ Tela final concatenada`);
         } else {
-          console.warn(`${ts()} [${jobId}] ⚠ Falha ao concatenar tela final — continuando sem ela`);
+          const stderrReal = extractStderr(result.stderr);
+          console.warn(`${ts()} [${jobId}] ⚠ Falha ao concatenar tela final — continuando sem ela: ${stderrReal}`);
         }
       }
     }
@@ -564,7 +595,10 @@ app.post('/render-video', async (req, res) => {
       }
 
       const result = runFFmpeg(['-y', '-i', finalVideoPath, '-c:v', 'copy', '-an', outputPath], 300);
-      if (result.status !== 0) throw new Error(`Erro ao finalizar vídeo: ${result.stderr?.slice(0, 400)}`);
+      if (result.status !== 0) {
+        const stderrReal = extractStderr(result.stderr);
+        throw new Error(`Erro ao finalizar vídeo: ${stderrReal}`);
+      }
 
     } else {
       // Duração calculada sem ffprobe
@@ -588,9 +622,13 @@ app.post('/render-video', async (req, res) => {
       const result = runFFmpeg(args, 300);
 
       if (result.status !== 0) {
-        console.warn(`${ts()} [${jobId}] ⚠ Erro na trilha — fallback sem áudio: ${result.stderr?.slice(0, 300)}`);
+        const stderrReal = extractStderr(result.stderr);
+        console.warn(`${ts()} [${jobId}] ⚠ Erro na trilha — fallback sem áudio: ${stderrReal}`);
         const fallback = runFFmpeg(['-y', '-i', finalVideoPath, '-c:v', 'copy', '-an', outputPath], 300);
-        if (fallback.status !== 0) throw new Error(`Erro ao finalizar vídeo: ${fallback.stderr?.slice(0, 400)}`);
+        if (fallback.status !== 0) {
+          const stderrFallback = extractStderr(fallback.stderr);
+          throw new Error(`Erro ao finalizar vídeo: ${stderrFallback}`);
+        }
       }
     }
 
@@ -616,7 +654,7 @@ app.post('/render-video', async (req, res) => {
     return res.status(500).json({
       success: false,
       error:   'Falha ao renderizar o vídeo.',
-      detail:  errMsg.slice(0, 500),
+      detail:  errMsg.slice(0, 1500),
     });
 
   } finally {
