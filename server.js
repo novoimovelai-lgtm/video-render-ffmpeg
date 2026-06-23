@@ -1,26 +1,30 @@
 /**
  * ============================================================
  * server.js — Cloud Run: Vídeo de Apresentação do Imóvel
- * Novoimovel.AI — stable-basic-video-v1
+ * Novoimovel.AI — stable-basic-video-v2-redirect-safe
  * ============================================================
  *
- * Versão mínima estável:
+ * Versão mínima estável com download robusto (redirects 301-308):
  * - Sem Ken Burns / zoompan
- * - Sem drawtext / watermark / corretor durante fotos
- * - Sem xfade / transições complexas
+ * - Sem drawtext / watermark / corretor
+ * - Sem xfade / transições
  * - Sem tela final
  * - Sem trilha sonora
  * - Sem logo
  *
- * Fluxo: fotos → segmentos simples → concat → base64
+ * downloadFile aceita:
+ *   A) data:image/jpeg;base64,...
+ *   B) data:image/png;base64,...
+ *   C) URL http
+ *   D) URL https
+ *   E) redirects 301, 302, 303, 307, 308 (até 5 níveis)
+ *
+ * Fluxo: fotos → segmentos simples (2.5s cada) → concat → base64
  *
  * Endpoint: POST /render-video
  * Retorno:  { success, videoBase64, filename, sizeMB, tempoTotal }
  *
- * Estrutura esperada:
- *   /app/server.js
- *
- * package.json (dependências necessárias):
+ * package.json:
  *   "express": "^4.18.2"
  *   "ffmpeg-static": "^5.2.0"
  * ============================================================
@@ -28,13 +32,14 @@
 
 'use strict';
 
-const express       = require('express');
+const express      = require('express');
 const { spawnSync } = require('child_process');
-const fs            = require('fs');
-const path          = require('path');
-const crypto        = require('crypto');
+const fs           = require('fs');
+const path         = require('path');
+const https        = require('https');
+const http         = require('http');
+const crypto       = require('crypto');
 
-// ── ffmpeg-static ─────────────────────────────────────────────
 const ffmpegPath = require('ffmpeg-static');
 
 const app  = express();
@@ -49,35 +54,17 @@ app.use(express.json({ limit: '200mb' }));
 function ts()  { return `[${new Date().toISOString()}]`; }
 function uid() { return crypto.randomBytes(6).toString('hex'); }
 
-/** Extrai a parte útil do stderr do FFmpeg (últimos 1200 chars onde fica o erro real). */
 function extractStderr(stderr) {
   if (!stderr) return 'sem stderr';
   return stderr.slice(-1200) || stderr.slice(0, 1200) || 'sem stderr';
 }
 
-/** Salva data URI base64 em arquivo local. Retorna true/false. */
-function saveDataUri(dataUri, destPath) {
-  try {
-    const commaIdx = dataUri.indexOf(',');
-    if (commaIdx === -1) return false;
-    const b64 = dataUri.slice(commaIdx + 1);
-    const buf = Buffer.from(b64, 'base64');
-    fs.writeFileSync(destPath, buf);
-    return true;
-  } catch (e) {
-    console.error(`[saveDataUri] Erro: ${e.message}`);
-    return false;
-  }
-}
-
-/** Remove arquivos temporários silenciosamente. */
 function cleanup(...paths) {
   for (const p of paths) {
     try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
   }
 }
 
-/** Executa ffmpeg com spawnSync. */
 function runFFmpeg(args, maxBufferMB = 300) {
   return spawnSync(ffmpegPath, args, {
     encoding: 'utf8',
@@ -86,35 +73,135 @@ function runFFmpeg(args, maxBufferMB = 300) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// downloadFile — robusto: data URI + redirects 301-308
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Baixa uma imagem (data URI ou URL http/https) para destPath.
+ * Segue redirects 301, 302, 303, 307, 308 até 5 níveis.
+ * Resolve true (sucesso) ou false (falha).
+ */
+function downloadFile(url, destPath, maxRedirects = 5) {
+  // ── Caso A/B: data URI (base64) ──
+  if (url.startsWith('data:')) {
+    try {
+      const commaIdx = url.indexOf(',');
+      if (commaIdx === -1) return Promise.resolve(false);
+      const b64 = url.slice(commaIdx + 1);
+      const buf = Buffer.from(b64, 'base64');
+      fs.writeFileSync(destPath, buf);
+      console.log(`${ts()} [downloadFile] Data URI salva: ${buf.length} bytes`);
+      return Promise.resolve(true);
+    } catch (e) {
+      console.error(`${ts()} [downloadFile] Erro ao decodificar base64: ${e.message}`);
+      return Promise.resolve(false);
+    }
+  }
+
+  // ── Caso C/D/E: URL http/https com redirects ──
+  return new Promise((resolve) => {
+    let redirects = 0;
+    let finalUrl  = url;
+
+    const doRequest = (reqUrl) => {
+      const proto = reqUrl.startsWith('https') ? https : http;
+
+      const req = proto.get(reqUrl, (res) => {
+        const status = res.statusCode;
+
+        // ── Redirect ──
+        if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
+          redirects++;
+          res.resume(); // consome o corpo do redirect
+
+          if (redirects > maxRedirects) {
+            console.error(`${ts()} [downloadFile] Máximo de ${maxRedirects} redirects excedido (URL inicial: ${url})`);
+            return resolve(false);
+          }
+
+          let location = res.headers.location;
+
+          // URL relativa → absoluta
+          try {
+            if (location.startsWith('/')) {
+              const parsed = new URL(reqUrl);
+              location = `${parsed.protocol}//${parsed.host}${location}`;
+            } else if (!location.startsWith('http')) {
+              const parsed = new URL(reqUrl);
+              location = new URL(location, `${parsed.protocol}//${parsed.host}`).href;
+            }
+          } catch (e) {
+            console.error(`${ts()} [downloadFile] Erro ao resolver redirect: ${e.message}`);
+            return resolve(false);
+          }
+
+          console.log(`${ts()} [downloadFile] Redirect ${redirects}/${maxRedirects}: ${status} → ${location}`);
+          finalUrl = location;
+          return doRequest(location);
+        }
+
+        // ── Status não-200 e não-redirect = erro real ──
+        if (status !== 200) {
+          console.error(`${ts()} [downloadFile] HTTP ${status} (URL final: ${reqUrl})`);
+          res.resume();
+          return resolve(false);
+        }
+
+        // ── Sucesso: salvar arquivo ──
+        const file = fs.createWriteStream(destPath);
+        res.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          const sizeBytes = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+          console.log(`${ts()} [downloadFile] ✓ Baixado: ${sizeBytes} bytes | URL final: ${finalUrl}`);
+          resolve(true);
+        });
+        file.on('error', () => {
+          fs.unlink(destPath, () => {});
+          resolve(false);
+        });
+      });
+
+      req.on('error', (e) => {
+        console.error(`${ts()} [downloadFile] Erro de rede: ${e.message} (URL: ${reqUrl})`);
+        resolve(false);
+      });
+    };
+
+    doRequest(url);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Constantes
 // ─────────────────────────────────────────────────────────────
+
+const VERSION = 'stable-basic-video-v2-redirect-safe';
 
 const RESOLUTIONS = {
   '9:16': { w: 720,  h: 1280 },
   '16:9': { w: 1280, h: 720  },
 };
 
-const PHOTO_DURATION = 2.8;  // segundos por foto
+const PHOTO_DURATION = 2.5;  // segundos por foto
 const FPS            = 25;
 
 // ─────────────────────────────────────────────────────────────
 // ROTAS
 // ─────────────────────────────────────────────────────────────
 
-/** Rota raiz — teste de status */
 app.get('/', (req, res) => {
   res.json({
     success: true,
     status:  'online',
     message: 'Novoimovel.AI Video Renderer Online',
-    version: 'stable-basic-video-v1',
+    version: VERSION,
     ffmpeg:  ffmpegPath ? 'available' : 'not_found',
   });
 });
 
-/** Health check */
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: VERSION, timestamp: new Date().toISOString() });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -127,24 +214,28 @@ app.post('/render-video', async (req, res) => {
   const tmpFiles = [];
 
   console.log(`\n${ts()} ========== /render-video JOB ${jobId} ==========`);
+  console.log(`${ts()} [${jobId}] version: ${VERSION}`);
 
   try {
-    // ── 1. Parse do payload ──────────────────────────────────────────
+    // ── 1. Parse do payload ───────────────────────────────────────────
     const {
       pedidoId,
       userEmail,
       images,
       format = '9:16',
+      music,
     } = req.body;
 
-    // ── 2. Validações básicas ────────────────────────────────────────
+    // ── 2. Validações ─────────────────────────────────────────────────
     if (!Array.isArray(images) || images.length < 5) {
+      console.error(`${ts()} [${jobId}] ERRO: menos de 5 imagens (${Array.isArray(images) ? images.length : 0})`);
       return res.status(400).json({
         success: false,
         error: 'Envie pelo menos 5 imagens para gerar o vídeo.',
       });
     }
     if (images.length > 12) {
+      console.error(`${ts()} [${jobId}] ERRO: mais de 12 imagens (${images.length})`);
       return res.status(400).json({
         success: false,
         error: 'Envie no máximo 12 imagens para gerar o vídeo.',
@@ -156,53 +247,45 @@ app.post('/render-video', async (req, res) => {
     // ── Logs de entrada ──────────────────────────────────────────────
     console.log(`${ts()} [${jobId}] pedidoId:   ${pedidoId || 'n/a'}`);
     console.log(`${ts()} [${jobId}] userEmail:  ${userEmail || 'n/a'}`);
-    console.log(`${ts()} [${jobId}] images:     ${images.length} fotos`);
-    console.log(`${ts()} [${jobId}] format:     ${format} → ${w}x${h}`);
+    console.log(`${ts()} [${jobId}] fotos:      ${images.length}`);
+    console.log(`${ts()} [${jobId}] formato:    ${format} → ${w}x${h}`);
+    console.log(`${ts()} [${jobId}] music:      ${music || 'sem-trilha'}`);
     console.log(`${ts()} [${jobId}] ffmpegPath: ${ffmpegPath}`);
 
-    // ── 3. Salvar imagens em disco ───────────────────────────────────
-    console.log(`${ts()} [${jobId}] Salvando ${images.length} imagens...`);
+    // ── 3. Download/salvar imagens ───────────────────────────────────
+    console.log(`${ts()} [${jobId}] Baixando ${images.length} imagens...`);
     const imgPaths = [];
 
     for (let i = 0; i < images.length; i++) {
       const imgPath = `/tmp/img_${jobId}_${i}.jpg`;
-
       const isDataUri = images[i].startsWith('data:');
-      if (isDataUri) {
-        const ok = saveDataUri(images[i], imgPath);
-        if (!ok) throw new Error(`Falha ao salvar imagem ${i + 1} (data URI).`);
-      } else {
-        // URL pública — baixar via https/http
-        const proto = images[i].startsWith('https') ? require('https') : require('http');
-        await new Promise((resolve, reject) => {
-          const file = fs.createWriteStream(imgPath);
-          proto.get(images[i], (r) => {
-            if (r.statusCode !== 200) {
-              file.close();
-              fs.unlink(imgPath, () => {});
-              return reject(new Error(`HTTP ${r.statusCode} ao baixar imagem ${i + 1}`));
-            }
-            r.pipe(file);
-            file.on('finish', () => { file.close(); resolve(); });
-          }).on('error', reject);
+      const imgType = isDataUri ? 'base64' : 'URL';
+      console.log(`${ts()} [${jobId}] Imagem ${i + 1}/${images.length} | tipo: ${imgType}`);
+
+      const ok = await downloadFile(images[i], imgPath);
+      if (!ok) {
+        console.error(`${ts()} [${jobId}] ✗ Falha ao baixar imagem ${i + 1}`);
+        return res.status(500).json({
+          success: false,
+          error: `Falha ao baixar imagem ${i + 1}.`,
+          detail: `Tipo: ${imgType} | URL: ${images[i].slice(0, 120)}`,
         });
       }
 
       imgPaths.push(imgPath);
       tmpFiles.push(imgPath);
-      console.log(`${ts()} [${jobId}] Imagem ${i + 1}/${images.length} salva`);
     }
-    console.log(`${ts()} [${jobId}] ✓ Todas as imagens salvas`);
+    console.log(`${ts()} [${jobId}] ✓ Todas as ${imgPaths.length} imagens baixadas`);
 
-    // ── 4. Gerar segmentos simples por foto ──────────────────────────
-    console.log(`${ts()} [${jobId}] Gerando ${imgPaths.length} segmentos...`);
+    // ── 4. Gerar segmentos simples (sem zoompan, drawtext, logo) ──────
+    console.log(`${ts()} [${jobId}] Gerando ${imgPaths.length} segmentos (${PHOTO_DURATION}s cada)...`);
     const segmentPaths = [];
 
     for (let i = 0; i < imgPaths.length; i++) {
       const segPath = `/tmp/seg_${jobId}_${i}.mp4`;
       tmpFiles.push(segPath);
 
-      // Filtro simples: scale com crop para cobrir o formato sem distorcer
+      // scale com crop para preencher o formato sem distorcer
       const vf = [
         `scale=${w}:${h}:force_original_aspect_ratio=increase`,
         `crop=${w}:${h}`,
@@ -224,29 +307,28 @@ app.post('/render-video', async (req, res) => {
         segPath,
       ];
 
-      console.log(`${ts()} [${jobId}] Seg ${i + 1}/${imgPaths.length} — ffmpeg iniciando`);
+      console.log(`${ts()} [${jobId}] Seg ${i + 1}/${imgPaths.length} processando...`);
       const result = runFFmpeg(args, 150);
 
       if (result.status !== 0) {
         const stderrReal = extractStderr(result.stderr);
-        console.error(`${ts()} [${jobId}] FFmpeg seg ${i} STDERR:\n${stderrReal}`);
+        console.error(`${ts()} [${jobId}] FFmpeg seg ${i + 1} STDERR:\n${stderrReal}`);
         throw new Error(`Erro ao processar imagem ${i + 1}: ${stderrReal}`);
       }
 
       console.log(`${ts()} [${jobId}] ✓ Seg ${i + 1} gerado`);
       segmentPaths.push(segPath);
     }
-    console.log(`${ts()} [${jobId}] ✓ Todos os segmentos gerados`);
+    console.log(`${ts()} [${jobId}] ✓ Todos os ${segmentPaths.length} segmentos gerados`);
 
-    // ── 5. Concatenar segmentos com concat demuxer ───────────────────
+    // ── 5. Concatenar (concat demuxer — sem xfade) ────────────────────
     console.log(`${ts()} [${jobId}] Concatenando segmentos...`);
 
     const listPath   = `/tmp/concatlist_${jobId}.txt`;
     const outputPath = `/tmp/output_${jobId}.mp4`;
     tmpFiles.push(listPath, outputPath);
 
-    const listContent = segmentPaths.map(p => `file '${p}'`).join('\n');
-    fs.writeFileSync(listPath, listContent);
+    fs.writeFileSync(listPath, segmentPaths.map(p => `file '${p}'`).join('\n'));
 
     const concatArgs = [
       '-y',
@@ -279,11 +361,10 @@ app.post('/render-video', async (req, res) => {
     const tempoTotal = ((Date.now() - t0) / 1000).toFixed(1);
 
     console.log(`${ts()} [${jobId}] ✓ Vídeo final: ${sizeMB} MB | ${tempoTotal}s`);
+    console.log(`${ts()} [${jobId}] ========== CONCLUÍDO em ${tempoTotal}s ==========\n`);
 
     const videoBase64 = fs.readFileSync(outputPath).toString('base64');
     const filename    = `${pedidoId || jobId}.mp4`;
-
-    console.log(`${ts()} [${jobId}] ========== CONCLUÍDO em ${tempoTotal}s ==========\n`);
 
     return res.json({
       success:    true,
@@ -315,6 +396,6 @@ app.post('/render-video', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`${ts()} Servidor iniciado na porta ${PORT}`);
-  console.log(`${ts()} version: stable-basic-video-v1`);
+  console.log(`${ts()} version: ${VERSION}`);
   console.log(`${ts()} ffmpegPath: ${ffmpegPath || 'NÃO ENCONTRADO'}`);
 });
